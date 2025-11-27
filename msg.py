@@ -9,23 +9,17 @@ from playwright.sync_api import sync_playwright
 
 def sanitize_input(raw):
     """
-    Fix shell-truncated input (e.g., when '&' breaks in CMD or bot execution).
-    If input comes as a list (from nargs='+'), join it back into a single string.
+    Windows-safe input:
+    Always treat --names as ONE SINGLE string.
     """
-    if isinstance(raw, list):
-        raw = " ".join(raw)
-    return raw
+    return str(raw)
 
 def parse_messages(names_arg):
     """
-    Robust parser for messages:
-    - If names_arg is a .txt file, first try JSON-lines parsing (one JSON string per line, supporting multi-line messages).
-    - If that fails, read the entire file content as a single block and split only on explicit separators '&' or 'and' (preserving newlines within each message for ASCII art).
-    - For direct string input, treat as single block and split only on separators.
-    This ensures ASCII art (multi-line blocks without separators) is preserved as a single message.
+    Always treat names_arg as a SINGLE RAW STRING.
+    Windows CMD fix for 'and' separators.
     """
-    # Handle argparse nargs possibly producing a list
-    if isinstance(names_arg, list):
+    if isinstance(names_arg, list):   # If cmd breaks, join with space
         names_arg = " ".join(names_arg)
 
     content = None
@@ -159,7 +153,7 @@ def main():
     parser.add_argument('--username', required=False, help='Instagram username (required for initial login)')
     parser.add_argument('--password', required=False, help='Instagram password (required for initial login)')
     parser.add_argument('--thread-url', required=True, help='Full Instagram direct thread URL')
-    parser.add_argument('--names', nargs='+', required=True, help='Messages list, direct string, or .txt file (split on & or "and" for multiple; preserves newlines for art)')
+    parser.add_argument('--names', required=True, help='Messages list, direct string, or .txt file (split on & or "and" for multiple; preserves newlines for art)')
     parser.add_argument('--headless', default='true', choices=['true', 'false'], help='Run in headless mode (default: true)')
     parser.add_argument('--storage-state', required=True, help='Path to JSON file for login state (persists session)')
     parser.add_argument('--tabs', type=int, default=1, help='Number of parallel tabs (1-5, default 1)')
