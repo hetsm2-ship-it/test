@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""
+Instagram DM Auto Sender (recode)
+
+- Uses a single Playwright browser and context; each thread creates a page (tab).
+- After initial login, directly opens the provided thread URL (so it won't hang waiting for /home).
+- Message splitter: splits on '&' or substring 'and' (case-insensitive).
+- Preserves newline characters in messages (for ASCII art).
+- Supports JSON-lines .txt (each line is a JSON string) or plain .txt with separators.
+- Intended for Windows Server 2022 (tested for Playwright usage patterns).
+"""
+
 import argparse
 import os
 import time
@@ -5,32 +17,29 @@ import re
 import unicodedata
 import json
 import threading
-from playwright.sync_api import sync_playwright
+import sys
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-# --- Minimal globals to share one Playwright/browser/context across threads (so threads create tabs) ---
-GLOBAL_PW = None
-GLOBAL_BROWSER = None
-GLOBAL_CONTEXT = None
-# -----------------------------------------------------------------------------------------------
+# Shared resources (one browser & context for all threads)
+_GLOBAL_PW = None
+_GLOBAL_BROWSER = None
+_GLOBAL_CONTEXT = None
 
 def sanitize_input(raw):
-    """
-    Fix shell-truncated input (e.g., when '&' breaks in CMD or bot execution).
-    If input comes as a list (from nargs='+'), join it back into a single string.
-    """
+    """Make sure names passed from argparse (maybe nargs) are treated as a single string."""
     if isinstance(raw, list):
-        raw = " ".join(raw)
-    return raw
+        return " ".join(raw)
+    return str(raw)
 
 def parse_messages(names_arg):
     """
-    Robust parser for messages:
-    - If names_arg is a .txt file, first try JSON-lines parsing (one JSON string per line, supporting multi-line messages).
-    - If that fails, read the entire file content as a single block and split only on explicit separators '&' or 'and' (preserving newlines within each message for ASCII art).
-    - For direct string input, treat as single block and split only on separators.
-    This ensures ASCII art (multi-line blocks without separators) is preserved as a single message.
+    Parse messages from either:
+     - .txt file (tries JSON-lines first; otherwise reads whole file and splits on separators)
+     - direct string input
+
+    Splitting separators: '&' or substring 'and' (case-insensitive).
+    Preserves newlines inside messages.
     """
-    # Handle argparse nargs possibly producing a list
     if isinstance(names_arg, list):
         names_arg = " ".join(names_arg)
 
@@ -38,264 +47,345 @@ def parse_messages(names_arg):
     is_file = isinstance(names_arg, str) and names_arg.endswith('.txt') and os.path.exists(names_arg)
 
     if is_file:
-        # Try JSON-lines first (each line is a JSON-encoded string, possibly with \n for multi-line)
+        # Try JSON-lines: each non-empty line is JSON-encoded string message
         try:
             msgs = []
             with open(names_arg, 'r', encoding='utf-8') as f:
-                lines = [ln.rstrip('\n') for ln in f if ln.strip()]  # Skip empty lines
+                lines = [ln.rstrip('\n') for ln in f if ln.strip()]
             for ln in lines:
+                # if line is JSON string
                 m = json.loads(ln)
                 if isinstance(m, str):
                     msgs.append(m)
                 else:
-                    raise ValueError("JSON line is not a string")
+                    raise ValueError("JSON line is not a JSON string")
             if msgs:
-                # Normalize each message (preserve \n for art)
+                # normalize unicode and strip zero-width characters
                 out = []
                 for m in msgs:
-                    m = unicodedata.normalize("NFKC", m)
-                    m = re.sub(r'[\u200B-\u200F\uFEFF\u202A-\u202E\u2060-\u206F]', '', m)
-                    out.append(m)
+                    mm = unicodedata.normalize("NFKC", m)
+                    mm = re.sub(r'[\u200B-\u200F\uFEFF\u202A-\u202E\u2060-\u206F]', '', mm)
+                    out.append(mm)
                 return out
         except Exception:
-            pass  # Fall through to block parsing on any error
+            # fallback to whole-file parsing
+            pass
 
-        # Fallback: read entire file as one block for separator-based splitting
         try:
             with open(names_arg, 'r', encoding='utf-8') as f:
                 content = f.read()
         except Exception as e:
             raise ValueError(f"Failed to read file {names_arg}: {e}")
     else:
-        # Direct string input
         content = str(names_arg)
 
     if content is None:
-        raise ValueError("No valid content to parse")
+        raise ValueError("No content to parse")
 
-    # Normalize content (preserve \n for ASCII art)
+    # normalize
     content = unicodedata.normalize("NFKC", content)
     content = content.replace("\r\n", "\n").replace("\r", "\n")
     content = re.sub(r'[\u200B-\u200F\uFEFF\u202A-\u202E\u2060-\u206F]', '', content)
 
-    # Normalize ampersand-like characters to '&' for consistent splitting
-    content = (
-        content.replace('﹠', '&')
-        .replace('＆', '&')
-        .replace('⅋', '&')
-        .replace('ꓸ', '&')
-        .replace('︔', '&')
-    )
+    # normalize variants of '&'
+    content = (content.replace('﹠', '&').replace('＆', '&').replace('⅋', '&')
+               .replace('ꓸ', '&').replace('︔', '&'))
 
-    # ----------------- MINIMAL CHANGE: split on '&' or substring 'and' (case-insensitive) -----------------
-    # This will split strings like "spyther1andspytger2andspytger3" into three parts.
+    # Split on & or substring "and" (case-insensitive). This will split "spyther1andspyther2"
     pattern = r'\s*(?:&|and)\s*'
-    # --------------------------------------------------------------------------------------------------------
     parts = [part.strip() for part in re.split(pattern, content, flags=re.IGNORECASE) if part.strip()]
     return parts
 
-def sender(tab_id, args, messages, headless, storage_path):
+def do_initial_login(thread_url, username, password, storage_path, headless):
     """
-    Sender thread: Cycles through messages in an infinite loop, preloading/reloading pages every 60s to avoid issues.
-    Preserves newlines in messages for multi-line content like ASCII art.
-    Uses shared GLOBAL_CONTEXT so this thread creates a tab (page) instead of launching a new browser.
+    Perform an initial login using a temporary browser/context and save storage_state to storage_path.
+    After successful login submit, immediately navigate to thread_url and wait for thread textbox to appear.
+    Return True on success, False otherwise.
     """
-    # Use shared GLOBAL_CONTEXT created in main()
-    global GLOBAL_CONTEXT
-    if GLOBAL_CONTEXT is None:
-        raise RuntimeError("GLOBAL_CONTEXT is not initialized. main() must create the shared Playwright context before starting sender threads.")
+    print("Starting initial login flow...")
+    p = sync_playwright().start()
+    browser = None
+    context = None
+    page = None
+    try:
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context()
+        page = context.new_page()
 
-    context = GLOBAL_CONTEXT
-    page = context.new_page()
+        # go to login page (use accounts/login to reduce landing redirects)
+        page.goto("https://www.instagram.com/accounts/login/", timeout=60000)
+        # wait for username input
+        page.wait_for_selector('input[name="username"]', timeout=30000)
+        page.fill('input[name="username"]', username)
+        page.fill('input[name="password"]', password)
+
+        # click submit
+        # Instagram's login button may be a button[type=submit] or [role=button]
+        try:
+            page.click('button[type="submit"]')
+        except Exception:
+            # fallback: press Enter in password
+            page.press('input[name="password"]', 'Enter')
+
+        # After submit, don't wait for /home — directly attempt to open the thread_url.
+        # If login failed, the thread page will either redirect to login or show the login form again.
+        try:
+            page.goto(thread_url, timeout=60000)
+            # Wait for the DM textarea selector (same as sender uses)
+            dm_selector = 'div[role="textbox"][aria-label="Message"]'
+            page.wait_for_selector(dm_selector, timeout=30000)
+            # If selector found, save storage state and return success
+            context.storage_state(path=storage_path)
+            print("Login succeeded and thread opened — storage state saved.")
+            return True
+        except PWTimeoutError:
+            # If timeout opening thread, try a short check: if login form still present, login failed
+            try:
+                if page.query_selector('input[name="username"]'):
+                    print("Login appears to have failed (login form still present).")
+                    return False
+            except Exception:
+                pass
+            # Try one more time to save storage (if logged in but thread slow)
+            try:
+                context.storage_state(path=storage_path)
+                print("Saved storage state (login may have completed).")
+                return True
+            except Exception as e:
+                print(f"Could not confirm login and could not save storage state: {e}")
+                return False
+    except Exception as e:
+        print(f"Initial login error: {e}")
+        return False
+    finally:
+        try:
+            if page:
+                page.close()
+        except Exception:
+            pass
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            p.stop()
+        except Exception:
+            pass
+
+def sender_loop(tab_id, page, args, messages):
+    """
+    The per-tab sender loop. Uses the provided Playwright Page (tab).
+    Behavior preserved from original: preload a new page at ~50s, switch at 60s, preserve newlines, small delays.
+    """
     dm_selector = 'div[role="textbox"][aria-label="Message"]'
     try:
         page.goto(args.thread_url, timeout=60000)
         page.wait_for_selector(dm_selector, timeout=30000)
-        print(f"Tab {tab_id} ready, starting infinite message loop.")
-        current_page = page
-        cycle_start = time.time()
-        new_page = None
-        preloaded_this_cycle = False
-        msg_index = 0
-        while True:
-            elapsed = time.time() - cycle_start
-            if elapsed >= 60:
-                if new_page is not None:
-                    try:
-                        current_page.close()
-                    except Exception:
-                        pass
-                    current_page = new_page
-                    print(f"Tab {tab_id} switched to new page after {elapsed:.1f}s")
-                else:
-                    print(f"Tab {tab_id} no new page, reloading current after {elapsed:.1f}s")
+    except Exception as e:
+        print(f"Tab {tab_id} initial navigation error: {e}")
+
+    print(f"Tab {tab_id} ready, starting infinite message loop.")
+    current_page = page
+    cycle_start = time.time()
+    new_page = None
+    preloaded_this_cycle = False
+    msg_index = 0
+
+    while True:
+        elapsed = time.time() - cycle_start
+        if elapsed >= 60:
+            if new_page:
+                try:
+                    current_page.close()
+                except Exception:
+                    pass
+                current_page = new_page
+                print(f"Tab {tab_id} switched to new page after {elapsed:.1f}s")
+            else:
+                # reload
+                try:
                     current_page.goto(args.thread_url, timeout=60000)
                     current_page.wait_for_selector(dm_selector, timeout=30000)
-                cycle_start = time.time()
-                new_page = None
-                preloaded_this_cycle = False
-                continue
-            if elapsed >= 50 and not preloaded_this_cycle:
-                preloaded_this_cycle = True
-                try:
-                    new_page = context.new_page()
-                    new_page.goto(args.thread_url, timeout=60000)
-                    new_page.wait_for_selector(dm_selector, timeout=30000)
-                    print(f"Tab {tab_id} preloaded new page at {elapsed:.1f}s")
                 except Exception as e:
-                    new_page = None
-                    print(f"Tab {tab_id} failed to preload new page at {elapsed:.1f}s: {e}")
-            msg = messages[msg_index]
+                    print(f"Tab {tab_id} reload error: {e}")
+            cycle_start = time.time()
+            new_page = None
+            preloaded_this_cycle = False
+            continue
+
+        if elapsed >= 50 and not preloaded_this_cycle:
+            preloaded_this_cycle = True
             try:
-                if not current_page.locator(dm_selector).is_visible():
-                    print(f"Tab {tab_id} selector not visible, skipping '{msg[:50]}...'")
-                    time.sleep(0.3)
-                    msg_index = (msg_index + 1) % len(messages)
-                    continue
-                # DO NOT replace \n with space: Preserve multi-line for ASCII art
-                # Instagram DM supports multi-line messages via fill()
-                current_page.click(dm_selector)
-                current_page.fill(dm_selector, msg)
-                current_page.press(dm_selector, 'Enter')
-                print(f"Tab {tab_id} sent message {msg_index + 1}/{len(messages)}")
-                time.sleep(0.3)  # Brief delay between sends
+                new_page = current_page.context.new_page()
+                new_page.goto(args.thread_url, timeout=60000)
+                new_page.wait_for_selector(dm_selector, timeout=30000)
+                print(f"Tab {tab_id} preloaded new page at {elapsed:.1f}s")
             except Exception as e:
-                print(f"Tab {tab_id} error sending message {msg_index + 1}: {e}")
-                time.sleep(0.3)
-            msg_index = (msg_index + 1) % len(messages)
-    except Exception as e:
-        print(f"Tab {tab_id} unexpected error: {e}")
-    finally:
+                new_page = None
+                print(f"Tab {tab_id} failed to preload new page at {elapsed:.1f}s: {e}")
+
+        # send message
+        msg = messages[msg_index]
         try:
-            page.close()
-        except Exception:
-            pass
+            # ensure visible
+            if not current_page.locator(dm_selector).is_visible():
+                print(f"Tab {tab_id} selector not visible, skipping '{msg[:50]}...'")
+                time.sleep(0.3)
+                msg_index = (msg_index + 1) % len(messages)
+                continue
+
+            current_page.click(dm_selector)
+            # preserve newlines (ASCII art)
+            current_page.fill(dm_selector, msg)
+            current_page.press(dm_selector, 'Enter')
+            print(f"Tab {tab_id} sent message {msg_index + 1}/{len(messages)}")
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"Tab {tab_id} error sending message {msg_index + 1}: {e}")
+            time.sleep(0.3)
+
+        msg_index = (msg_index + 1) % len(messages)
 
 def main():
-    parser = argparse.ArgumentParser(description="Instagram DM Auto Sender using Playwright")
+    global _GLOBAL_PW, _GLOBAL_BROWSER, _GLOBAL_CONTEXT
+
+    parser = argparse.ArgumentParser(description="Instagram DM Auto Sender (fixed)")
     parser.add_argument('--username', required=False, help='Instagram username (required for initial login)')
     parser.add_argument('--password', required=False, help='Instagram password (required for initial login)')
     parser.add_argument('--thread-url', required=True, help='Full Instagram direct thread URL')
-    parser.add_argument('--names', nargs='+', required=True, help='Messages list, direct string, or .txt file (split on & or "and" for multiple; preserves newlines for art)')
+    parser.add_argument('--names', nargs='+', required=True, help='Messages list, direct string, or .txt file (split on & or "and")')
     parser.add_argument('--headless', default='true', choices=['true', 'false'], help='Run in headless mode (default: true)')
     parser.add_argument('--storage-state', required=True, help='Path to JSON file for login state (persists session)')
     parser.add_argument('--tabs', type=int, default=1, help='Number of parallel tabs (1-5, default 1)')
     args = parser.parse_args()
-    args.names = sanitize_input(args.names)  # Handle bot/shell-truncated inputs
+
+    # Normalize names input
+    names_raw = sanitize_input(args.names)
 
     headless = args.headless == 'true'
     storage_path = args.storage_state
-    do_login = not os.path.exists(storage_path)
+    tabs = min(max(args.tabs, 1), 5)
 
-    if do_login:
+    # If storage state doesn't exist, perform initial login and directly open thread URL there.
+    if not os.path.exists(storage_path):
         if not args.username or not args.password:
             print("Error: Username and password required for initial login.")
             return
-        # keep your original login flow exactly as before
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
-            context = browser.new_context()
-            page = context.new_page()
-            try:
-                print("Logging in to Instagram...")
-                page.goto("https://www.instagram.com/", timeout=60000)
-                page.wait_for_selector('input[name="username"]', timeout=30000)
-                page.fill('input[name="username"]', args.username)
-                page.fill('input[name="password"]', args.password)
-                page.click('button[type="submit"]')
-                # Wait for successful redirect (adjust if needed for 2FA or errors)
-                page.wait_for_url("**/home**", timeout=60000)  # More specific to profile/home
-                print("Login successful, saving storage state.")
-                context.storage_state(path=storage_path)
-            except Exception as e:
-                print(f"Login error: {e}")
-                return
-            finally:
-                browser.close()
+        ok = do_initial_login(args.thread_url, args.username, args.password, storage_path, headless)
+        if not ok:
+            print("Initial login failed — please check credentials or 2FA and try again.")
+            return
     else:
-        print("Using existing storage state, skipping login.")
+        print("Using existing storage state, skipping initial login.")
 
-    # --- Create single shared Playwright browser/context for tabs (minimal non-invasive init) ---
-    global GLOBAL_PW, GLOBAL_BROWSER, GLOBAL_CONTEXT
-    # start Playwright (sync) and launch one browser + context that uses the storage state
-    GLOBAL_PW = sync_playwright().start()
-    GLOBAL_BROWSER = GLOBAL_PW.chromium.launch(headless=headless)
-    GLOBAL_CONTEXT = GLOBAL_BROWSER.new_context(storage_state=storage_path)
-    # ----------------------------------------------------------------------------------------
-
+    # Create single Playwright instance / browser / context for all tabs
     try:
-        messages = parse_messages(args.names)
-    except ValueError as e:
+        _GLOBAL_PW = sync_playwright().start()
+        _GLOBAL_BROWSER = _GLOBAL_PW.chromium.launch(headless=headless)
+        _GLOBAL_CONTEXT = _GLOBAL_BROWSER.new_context(storage_state=storage_path)
+    except Exception as e:
+        print(f"Failed to start Playwright/browser/context: {e}")
+        # attempt cleanup
+        try:
+            if _GLOBAL_BROWSER:
+                _GLOBAL_BROWSER.close()
+        except Exception:
+            pass
+        try:
+            if _GLOBAL_PW:
+                _GLOBAL_PW.stop()
+        except Exception:
+            pass
+        return
+
+    # Parse messages (may raise)
+    try:
+        messages = parse_messages(names_raw)
+    except Exception as e:
         print(f"Error parsing messages: {e}")
-        # cleanup shared resources before returning
+        # cleanup
         try:
-            if GLOBAL_CONTEXT:
-                GLOBAL_CONTEXT.close()
+            if _GLOBAL_CONTEXT:
+                _GLOBAL_CONTEXT.close()
         except Exception:
             pass
         try:
-            if GLOBAL_BROWSER:
-                GLOBAL_BROWSER.close()
+            if _GLOBAL_BROWSER:
+                _GLOBAL_BROWSER.close()
         except Exception:
             pass
         try:
-            if GLOBAL_PW:
-                GLOBAL_PW.stop()
+            if _GLOBAL_PW:
+                _GLOBAL_PW.stop()
         except Exception:
             pass
         return
 
     if not messages:
-        print("Error: No valid messages provided.")
-        # cleanup shared resources before returning
+        print("No messages parsed. Exiting.")
+        # cleanup
         try:
-            if GLOBAL_CONTEXT:
-                GLOBAL_CONTEXT.close()
+            if _GLOBAL_CONTEXT:
+                _GLOBAL_CONTEXT.close()
         except Exception:
             pass
         try:
-            if GLOBAL_BROWSER:
-                GLOBAL_BROWSER.close()
+            if _GLOBAL_BROWSER:
+                _GLOBAL_BROWSER.close()
         except Exception:
             pass
         try:
-            if GLOBAL_PW:
-                GLOBAL_PW.stop()
+            if _GLOBAL_PW:
+                _GLOBAL_PW.stop()
         except Exception:
             pass
         return
 
     print(f"Parsed {len(messages)} messages.")
 
-    tabs = min(max(args.tabs, 1), 5)
+    # Create pages (tabs) and start threads
     threads = []
+    pages = []
     for i in range(tabs):
-        t = threading.Thread(target=sender, args=(i + 1, args, messages, headless, storage_path))
-        t.daemon = True
+        try:
+            pg = _GLOBAL_CONTEXT.new_page()
+            pages.append(pg)
+        except Exception as e:
+            print(f"Failed to create page {i+1}: {e}")
+
+    # Start sender threads, each receives its own page
+    for i, pg in enumerate(pages):
+        t = threading.Thread(target=sender_loop, args=(i + 1, pg, args, messages), daemon=True)
         t.start()
         threads.append(t)
 
-    print(f"Starting {tabs} tab(s) in infinite message loop. Press Ctrl+C to stop.")
+    print(f"Starting {len(threads)} tab(s) in infinite message loop. Press Ctrl+C to stop.")
     try:
         for t in threads:
             t.join()
     except KeyboardInterrupt:
         print("\nStopping all tabs...")
 
-    # cleanup shared resources
+    # Cleanup
     try:
-        if GLOBAL_CONTEXT:
-            GLOBAL_CONTEXT.close()
+        if _GLOBAL_CONTEXT:
+            _GLOBAL_CONTEXT.close()
     except Exception:
         pass
     try:
-        if GLOBAL_BROWSER:
-            GLOBAL_BROWSER.close()
+        if _GLOBAL_BROWSER:
+            _GLOBAL_BROWSER.close()
     except Exception:
         pass
     try:
-        if GLOBAL_PW:
-            GLOBAL_PW.stop()
+        if _GLOBAL_PW:
+            _GLOBAL_PW.stop()
     except Exception:
         pass
 
