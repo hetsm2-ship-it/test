@@ -226,7 +226,7 @@ def main():
     tabs = min(max(args.tabs, 1), 5)
     threads = []
     for i in range(tabs):
-        t = threading.Thread(target=sender, args=(i + 1, args, messages, headless, storage_path))
+        t = threading.Thread(target=sender, args=(i + 1, args, messages))
         t.daemon = True
         t.start()
         threads.append(t)
