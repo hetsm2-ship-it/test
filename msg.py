@@ -7,11 +7,6 @@ import json
 import threading
 from playwright.sync_api import sync_playwright
 
-# Globals to share Playwright/browser/context across sender threads (so threads create tabs/pages)
-GLOBAL_PW = None
-GLOBAL_BROWSER = None
-GLOBAL_CONTEXT = None
-
 def sanitize_input(raw):
     """
     Fix shell-truncated input (e.g., when '&' breaks in CMD or bot execution).
@@ -93,16 +88,17 @@ def parse_messages(names_arg):
     parts = [part.strip() for part in re.split(pattern, content, flags=re.IGNORECASE) if part.strip()]
     return parts
 
-def sender(tab_id, args, messages):
-    # Use shared GLOBAL_CONTEXT created in main() so this thread creates a tab (page) instead of launching a new browser.
-    global GLOBAL_CONTEXT
-    if GLOBAL_CONTEXT is None:
-        raise RuntimeError("GLOBAL_CONTEXT is not initialized. main() must create the shared Playwright context before starting sender threads.")
-
-    context = GLOBAL_CONTEXT
-    page = context.new_page()
-    dm_selector = 'div[role="textbox"][aria-label="Message"]'
+def sender(tab_id, args, messages, headless, storage_path):
+    pw = None
+    browser = None
+    context = None
+    page = None
     try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=headless)
+        context = browser.new_context(storage_state=storage_path)
+        page = context.new_page()
+        dm_selector = 'div[role="textbox"][aria-label="Message"]'
         page.goto(args.thread_url, timeout=60000)
         page.wait_for_selector(dm_selector, timeout=30000)
         print(f"Tab {tab_id} ready, starting infinite message loop.")
@@ -158,7 +154,23 @@ def sender(tab_id, args, messages):
         print(f"Tab {tab_id} unexpected error: {e}")
     finally:
         try:
-            page.close()
+            if page:
+                page.close()
+        except Exception:
+            pass
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if pw:
+                pw.stop()
         except Exception:
             pass
 
@@ -203,13 +215,6 @@ def main():
                 browser.close()
     else:
         print("Using existing storage state, skipping login.")
-    # Initialize single shared Playwright instance/browser/context so sender() uses pages (tabs) instead of launching new browsers
-    from playwright.sync_api import sync_playwright as _sync_playwright
-    global GLOBAL_PW, GLOBAL_BROWSER, GLOBAL_CONTEXT
-    # start Playwright (sync) and launch browser/context that uses storage state
-    GLOBAL_PW = _sync_playwright().start()
-    GLOBAL_BROWSER = GLOBAL_PW.chromium.launch(headless=headless)
-    GLOBAL_CONTEXT = GLOBAL_BROWSER.new_context(storage_state=storage_path)
 
     try:
         messages = parse_messages(args.names)
@@ -226,7 +231,7 @@ def main():
     tabs = min(max(args.tabs, 1), 5)
     threads = []
     for i in range(tabs):
-        t = threading.Thread(target=sender, args=(i + 1, args, messages))
+        t = threading.Thread(target=sender, args=(i + 1, args, messages, headless, storage_path))
         t.daemon = True
         t.start()
         threads.append(t)
@@ -237,23 +242,6 @@ def main():
             t.join()
     except KeyboardInterrupt:
         print("\nStopping all tabs...")
-        
-# cleanup shared Playwright resources
-    try:
-        if GLOBAL_CONTEXT:
-            GLOBAL_CONTEXT.close()
-    except Exception:
-        pass
-    try:
-        if GLOBAL_BROWSER:
-            GLOBAL_BROWSER.close()
-    except Exception:
-        pass
-    try:
-        if GLOBAL_PW:
-            GLOBAL_PW.stop()
-    except Exception:
-        pass
 
 if __name__ == "__main__":
     main()
