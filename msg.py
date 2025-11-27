@@ -4,13 +4,8 @@ import time
 import re
 import unicodedata
 import json
-import threading
-from playwright.sync_api import sync_playwright
-
-# Globals to share Playwright/browser/context across sender threads (so threads create tabs/pages)
-GLOBAL_PW = None
-GLOBAL_BROWSER = None
-GLOBAL_CONTEXT = None
+from playwright.async_api import async_playwright
+import asyncio
 
 def sanitize_input(raw):
     """
@@ -88,25 +83,19 @@ def parse_messages(names_arg):
 
     # Split only on explicit separators: '&' or the word 'and' (case-insensitive, with optional whitespace)
     # This preserves multi-line blocks like ASCII art unless explicitly separated
-    # split on '&' or substring 'and' (case-insensitive). This will split "spyther1andspytger2"
     pattern = r'\s*(?:&|and)\s*'
     parts = [part.strip() for part in re.split(pattern, content, flags=re.IGNORECASE) if part.strip()]
     return parts
 
-def sender(tab_id, args, messages):
-    global GLOBAL_CONTEXT
-    if GLOBAL_CONTEXT is None:
-        raise RuntimeError("GLOBAL_CONTEXT is not initialized. main() must create the shared Playwright context before starting sender threads.")
-
-    context = GLOBAL_CONTEXT
-    page = None
-    current_page = None
+async def sender(tab_id, page, args, messages, storage_path):
+    """
+    Sender task: Cycles through messages in an infinite loop, preloading/reloading pages every 60s to avoid issues.
+    Preserves newlines in messages for multi-line content like ASCII art.
+    """
+    dm_selector = 'div[role="textbox"][aria-label="Message"]'
     try:
-        page = context.new_page()
-        dm_selector = 'div[role="textbox"][aria-label="Message"]'
-        page.goto(args.thread_url, timeout=60000)
-        page.wait_for_selector(dm_selector, timeout=30000)
-
+        await page.goto(args.thread_url, timeout=60000)
+        await page.wait_for_selector(dm_selector, timeout=30000)
         print(f"Tab {tab_id} ready, starting infinite message loop.")
         current_page = page
         cycle_start = time.time()
@@ -117,63 +106,52 @@ def sender(tab_id, args, messages):
             elapsed = time.time() - cycle_start
             if elapsed >= 60:
                 if new_page is not None:
-                    current_page.close()
+                    await current_page.close()
                     current_page = new_page
                     print(f"Tab {tab_id} switched to new page after {elapsed:.1f}s")
                 else:
                     print(f"Tab {tab_id} no new page, reloading current after {elapsed:.1f}s")
-                    current_page.goto(args.thread_url, timeout=60000)
-                    current_page.wait_for_selector(dm_selector, timeout=30000)
+                    await current_page.goto(args.thread_url, timeout=60000)
+                    await current_page.wait_for_selector(dm_selector, timeout=30000)
                 cycle_start = time.time()
                 new_page = None
                 preloaded_this_cycle = False
                 continue
             if elapsed >= 50 and not preloaded_this_cycle:
                 preloaded_this_cycle = True
-                new_page_created = False
                 try:
-                    new_page = context.new_page()
-                    new_page.goto(args.thread_url, timeout=60000)
-                    new_page.wait_for_selector(dm_selector, timeout=30000)
+                    new_page = await page.context.new_page()
+                    await new_page.goto(args.thread_url, timeout=60000)
+                    await new_page.wait_for_selector(dm_selector, timeout=30000)
                     print(f"Tab {tab_id} preloaded new page at {elapsed:.1f}s")
-                    new_page_created = True
                 except Exception as e:
-                    if new_page is not None:
-                        try:
-                            new_page.close()
-                        except Exception:
-                            pass
                     new_page = None
                     print(f"Tab {tab_id} failed to preload new page at {elapsed:.1f}s: {e}")
             msg = messages[msg_index]
             try:
-                if not current_page.locator(dm_selector).is_visible():
+                if not await current_page.locator(dm_selector).is_visible():
                     print(f"Tab {tab_id} selector not visible, skipping '{msg[:50]}...'")
-                    time.sleep(0.3)
+                    await asyncio.sleep(0.3)
                     msg_index = (msg_index + 1) % len(messages)
                     continue
                 # DO NOT replace \n with space: Preserve multi-line for ASCII art
                 # Instagram DM supports multi-line messages via fill()
-                current_page.click(dm_selector)
-                current_page.fill(dm_selector, msg)
-                current_page.press(dm_selector, 'Enter')
+                await current_page.click(dm_selector)
+                await current_page.fill(dm_selector, msg)
+                await current_page.press(dm_selector, 'Enter')
                 print(f"Tab {tab_id} sent message {msg_index + 1}/{len(messages)}")
-                time.sleep(0.3)  # Brief delay between sends
+                await asyncio.sleep(0.3)  # Brief delay between sends
             except Exception as e:
                 print(f"Tab {tab_id} error sending message {msg_index + 1}: {e}")
-                time.sleep(0.3)
+                await asyncio.sleep(0.3)
             msg_index = (msg_index + 1) % len(messages)
     except Exception as e:
         print(f"Tab {tab_id} unexpected error: {e}")
     finally:
-        if current_page is not None:
-            try:
-                if not current_page.is_closed():
-                    current_page.close()
-            except Exception:
-                pass
+        if 'current_page' in locals() and not current_page.is_closed():
+            await current_page.close()
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Instagram DM Auto Sender using Playwright")
     parser.add_argument('--username', required=False, help='Instagram username (required for initial login)')
     parser.add_argument('--password', required=False, help='Instagram password (required for initial login)')
@@ -188,115 +166,71 @@ def main():
     headless = args.headless == 'true'
     storage_path = args.storage_state
     do_login = not os.path.exists(storage_path)
-    if do_login:
-        if not args.username or not args.password:
-            print("Error: Username and password required for initial login.")
-            return
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
-            context = browser.new_context()
-            page = context.new_page()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = None
+        if do_login:
+            if not args.username or not args.password:
+                print("Error: Username and password required for initial login.")
+                await browser.close()
+                return
+            context = await browser.new_context()
+            page = await context.new_page()
             try:
                 print("Logging in to Instagram...")
-                page.goto("https://www.instagram.com/", timeout=60000)
-                page.wait_for_selector('input[name="username"]', timeout=30000)
-                page.fill('input[name="username"]', args.username)
-                page.fill('input[name="password"]', args.password)
-                page.click('button[type="submit"]')
+                await page.goto("https://www.instagram.com/", timeout=60000)
+                await page.wait_for_selector('input[name="username"]', timeout=30000)
+                await page.fill('input[name="username"]', args.username)
+                await page.fill('input[name="password"]', args.password)
+                await page.click('button[type="submit"]')
                 # Wait for successful redirect (adjust if needed for 2FA or errors)
-                page.wait_for_url("**/home**", timeout=60000)  # More specific to profile/home
+                await page.wait_for_url("**/home**", timeout=60000)  # More specific to profile/home
                 print("Login successful, saving storage state.")
-                context.storage_state(path=storage_path)
+                await context.storage_state(path=storage_path)
             except Exception as e:
                 print(f"Login error: {e}")
+                await page.close()
+                await browser.close()
                 return
             finally:
-                browser.close()
-    else:
-        print("Using existing storage state, skipping login.")
+                await page.close()
+        else:
+            print("Using existing storage state, skipping login.")
+            context = await browser.new_context(storage_state=storage_path)
 
-    # Initialize single shared Playwright instance/browser/context so sender() uses pages (tabs) instead of launching new browsers
-    global GLOBAL_PW, GLOBAL_BROWSER, GLOBAL_CONTEXT
-    # start Playwright (sync) and launch browser/context that uses storage state
-    GLOBAL_PW = sync_playwright().start()
-    GLOBAL_BROWSER = GLOBAL_PW.chromium.launch(headless=headless)
-    GLOBAL_CONTEXT = GLOBAL_BROWSER.new_context(storage_state=storage_path)
+        try:
+            messages = parse_messages(args.names)
+        except ValueError as e:
+            print(f"Error parsing messages: {e}")
+            await browser.close()
+            return
 
-    try:
-        messages = parse_messages(args.names)
-    except ValueError as e:
-        print(f"Error parsing messages: {e}")
-        # cleanup
-        try:
-            if GLOBAL_CONTEXT:
-                GLOBAL_CONTEXT.close()
-        except:
-            pass
-        try:
-            if GLOBAL_BROWSER:
-                GLOBAL_BROWSER.close()
-        except:
-            pass
-        try:
-            if GLOBAL_PW:
-                GLOBAL_PW.stop()
-        except:
-            pass
-        return
+        if not messages:
+            print("Error: No valid messages provided.")
+            await browser.close()
+            return
 
-    if not messages:
-        print("Error: No valid messages provided.")
-        # cleanup
-        try:
-            if GLOBAL_CONTEXT:
-                GLOBAL_CONTEXT.close()
-        except:
-            pass
-        try:
-            if GLOBAL_BROWSER:
-                GLOBAL_BROWSER.close()
-        except:
-            pass
-        try:
-            if GLOBAL_PW:
-                GLOBAL_PW.stop()
-        except:
-            pass
-        return
+        print(f"Parsed {len(messages)} messages.")
 
-    print(f"Parsed {len(messages)} messages.")
+        tabs = min(max(args.tabs, 1), 5)
+        pages = []
+        for i in range(tabs):
+            page = await context.new_page()
+            pages.append(page)
 
-    tabs = min(max(args.tabs, 1), 5)
-    threads = []
-    for i in range(tabs):
-        t = threading.Thread(target=sender, args=(i + 1, args, messages))
-        t.daemon = True
-        t.start()
-        threads.append(t)
-
-    print(f"Starting {tabs} tab(s) in infinite message loop. Press Ctrl+C to stop.")
-    try:
-        for t in threads:
-            t.join()
-    except KeyboardInterrupt:
-        print("\nStopping all tabs...")
-    finally:
-        # cleanup shared Playwright resources
+        print(f"Starting {tabs} tab(s) in infinite message loop. Press Ctrl+C to stop.")
         try:
-            if GLOBAL_CONTEXT:
-                GLOBAL_CONTEXT.close()
-        except Exception:
-            pass
-        try:
-            if GLOBAL_BROWSER:
-                GLOBAL_BROWSER.close()
-        except Exception:
-            pass
-        try:
-            if GLOBAL_PW:
-                GLOBAL_PW.stop()
-        except Exception:
-            pass
+            tasks = [asyncio.create_task(sender(i + 1, pages[i], args, messages, storage_path)) for i in range(tabs)]
+            await asyncio.gather(*tasks)
+        except KeyboardInterrupt:
+            print("\nStopping all tabs...")
+        finally:
+            for page in pages:
+                if not page.is_closed():
+                    await page.close()
+            await context.close()
+            await browser.close()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
