@@ -1,8 +1,1 @@
-python3 msg.py \
---username botofahmad \
---password ahmad12 \
---thread-url https://www.instagram.com/direct/t/24241447548842542/ \
---names m.txt \
---tabs 3 \
---headless false \
---storage-state botofahmad_state.json
+python msg.py --username botofahmad --password ahmad12 --thread-url "https://www.instagram.com/direct/t/24241447548842542/" --names m.txt --tabs 3 --headless false --storage-state botofahmad_state.json
