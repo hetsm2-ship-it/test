@@ -16,6 +16,7 @@ from typing import Dict, List
 import threading
 import uuid
 import signal
+from multiprocessing.connection import Connection
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
 import asyncio
@@ -630,7 +631,7 @@ def reader_thread_pty(user_id: int, chat_id: int, master_fd: int, username: str,
                 SESSIONS.pop(user_id, None)
 
 # ---------------- Reader thread for Windows MP ----------------
-def reader_thread_mp(user_id: int, chat_id: int, conn: mp.connection.Connection, username: str, password: str, process: mp.Process):
+def reader_thread_mp(user_id: int, chat_id: int, conn: Connection, username: str, password: str, process: mp.Process):
     global APP, LOOP
     buf = ""
     pending_prompt = False
