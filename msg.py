@@ -84,7 +84,7 @@ def parse_messages(names_arg):
     # Split only on explicit separators: '&' or the word 'and' (case-insensitive, with optional whitespace)  
     # This preserves multi-line blocks like ASCII art unless explicitly separated  
     pattern = r'\s*(?:&|\band\b)\s*'  
-    parts = [part.strip() for part in re.split(pattern, content, flags=re.IGNORECASE) if part.strip()]  
+    parts = [part for part in re.split(pattern, content, flags=re.IGNORECASE) if part.strip()]  
     return parts
 
 async def login(args, storage_path, headless):
