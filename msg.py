@@ -16,24 +16,29 @@ def sanitize_input(raw):
         raw = " ".join(raw)
     return raw
 
-#def clean_message(msg):
+def preserve_whitespace(msg):
     """
-    Clean message for ASCII art: rstrip each line to remove extra trailing spaces,
-    preserve multi-line structure and leading spaces as in original txt.
+    Preserve whitespace in messages for ASCII art by replacing collapsible spaces
+    with non-breaking spaces (\u00a0). Process line-by-line to avoid affecting \n.
     """
-    #if not msg:
-        #return ''
-    #lines = msg.splitlines()
-    #cleaned = [line.rstrip() for line in lines]
-    #return '\n'.join(cleaned)
+    if not msg:
+        return ''
+    lines = msg.splitlines()
+    preserved_lines = []
+    space_pattern = r'[ \u3000]'  # Regular space and full-width space
+    for line in lines:
+        processed_line = re.sub(space_pattern, '\u00a0', line)
+        preserved_lines.append(processed_line)
+    return '\n'.join(preserved_lines)
 
 def parse_messages(names_arg):
     """
     Robust parser for messages:
     - If names_arg is a .txt file, first try JSON-lines parsing (one JSON string per line, supporting multi-line messages).
-    - If that fails, read the entire file content as a single block and split only on explicit separators '&' or 'and' (preserving newlines within each message for ASCII art).
+    - If that fails, read the entire file content as a single block and split only on explicit separators '&' (preserving newlines within each message for ASCII art).
     - For direct string input, treat as single block and split only on separators.
     This ensures ASCII art (multi-line blocks without separators) is preserved as a single message.
+    Note: Splitting on 'and' removed to avoid breaking inline connectors in art.
     """
     # Handle argparse nargs possibly producing a list
     if isinstance(names_arg, list):
@@ -55,8 +60,8 @@ def parse_messages(names_arg):
                 else:  
                     raise ValueError("JSON line is not a string")  
             if msgs:  
-                # Normalize each message (preserve \n for art)  
-                out = [clean_message(m) for m in msgs]  
+                # No cleaning; preserve original formatting  
+                out = msgs  
                 return out  
         except Exception:  
             pass  # Fall through to block parsing on any error  
@@ -88,11 +93,11 @@ def parse_messages(names_arg):
         .replace('︔', '&')  
     )  
 
-    # Split only on explicit separators: '&' or the word 'and' (case-insensitive, with optional whitespace)  
-    # This preserves multi-line blocks like ASCII art unless explicitly separated  
-    pattern = r'\s*(?:&|\band\b)\s*'  
-    parts = [part for part in re.split(pattern, content, flags=re.IGNORECASE) if part.strip()]  
-    return [part for part in parts]
+    # Split only on explicit separators: '&' (case-insensitive, with optional whitespace)  
+    # This preserves multi-line blocks like ASCII art unless explicitly separated with &  
+    pattern = r'\s*(?:&)\s*'  
+    parts = [part.strip() for part in re.split(pattern, content, flags=re.IGNORECASE) if part.strip()]  
+    return parts
 
 async def login(args, storage_path, headless):
     """
@@ -129,6 +134,7 @@ async def sender(tab_id, args, messages, context, page):
     Async sender coroutine: Cycles through messages in an infinite loop, preloading/reloading pages every 60s to avoid issues.
     Preserves newlines in messages for multi-line content like ASCII art.
     Uses shared context to create new pages for reloading.
+    Applies whitespace preservation before sending to prevent collapse in DM textbox.
     """
     dm_selector = 'div[role="textbox"][aria-label="Message"]'
     try:
@@ -170,10 +176,12 @@ async def sender(tab_id, args, messages, context, page):
                     await asyncio.sleep(0.3)
                     msg_index = (msg_index + 1) % len(messages)
                     continue
+                # Preserve whitespace for ASCII art before sending
+                preserved_msg = preserve_whitespace(msg)
                 # DO NOT replace \n with space: Preserve multi-line for ASCII art
                 # Instagram DM supports multi-line messages via fill()
                 await current_page.click(dm_selector)
-                await current_page.fill(dm_selector, msg)
+                await current_page.fill(dm_selector, preserved_msg)
                 await current_page.press(dm_selector, 'Enter')
                 print(f"Tab {tab_id} sent message {msg_index + 1}/{len(messages)}")
                 await asyncio.sleep(0.3)  # Brief delay between sends
@@ -189,7 +197,7 @@ async def main():
     parser.add_argument('--username', required=False, help='Instagram username (required for initial login)')
     parser.add_argument('--password', required=False, help='Instagram password (required for initial login)')
     parser.add_argument('--thread-url', required=True, help='Full Instagram direct thread URL')
-    parser.add_argument('--names', nargs='+', required=True, help='Messages list, direct string, or .txt file (split on & or "and" for multiple; preserves newlines for art)')
+    parser.add_argument('--names', nargs='+', required=True, help='Messages list, direct string, or .txt file (split on & for multiple; preserves newlines for art)')
     parser.add_argument('--headless', default='true', choices=['true', 'false'], help='Run in headless mode (default: true)')
     parser.add_argument('--storage-state', required=True, help='Path to JSON file for login state (persists session)')
     parser.add_argument('--tabs', type=int, default=1, help='Number of parallel tabs (1-5, default 1)')
