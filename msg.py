@@ -4,8 +4,8 @@ import time
 import re
 import unicodedata
 import json
-import asyncio
 from playwright.async_api import async_playwright
+import asyncio
 
 def sanitize_input(raw):
     """
@@ -28,103 +28,74 @@ def parse_messages(names_arg):
     if isinstance(names_arg, list):
         names_arg = " ".join(names_arg)
 
-    content = None  
-    is_file = isinstance(names_arg, str) and names_arg.endswith('.txt') and os.path.exists(names_arg)  
+    content = None
+    is_file = isinstance(names_arg, str) and names_arg.endswith('.txt') and os.path.exists(names_arg)
 
-    if is_file:  
-        # Try JSON-lines first (each line is a JSON-encoded string, possibly with \n for multi-line)  
-        try:  
-            msgs = []  
-            with open(names_arg, 'r', encoding='utf-8') as f:  
-                lines = [ln.rstrip('\n') for ln in f if ln.strip()]  # Skip empty lines  
-            for ln in lines:  
-                m = json.loads(ln)  
-                if isinstance(m, str):  
-                    msgs.append(m)  
-                else:  
-                    raise ValueError("JSON line is not a string")  
-            if msgs:  
-                # Normalize each message (preserve \n for art)  
-                out = []  
-                for m in msgs:  
-                    #m = unicodedata.normalize("NFKC", m)  
-                    #m = re.sub(r'[\u200B-\u200F\uFEFF\u202A-\u202E\u2060-\u206F]', '', m)  
-                    out.append(m)  
-                return out  
-        except Exception:  
-            pass  # Fall through to block parsing on any error  
+    if is_file:
+        # Try JSON-lines first (each line is a JSON-encoded string, possibly with \n for multi-line)
+        try:
+            msgs = []
+            with open(names_arg, 'r', encoding='utf-8') as f:
+                lines = [ln.rstrip('\n') for ln in f if ln.strip()]  # Skip empty lines
+            for ln in lines:
+                m = json.loads(ln)
+                if isinstance(m, str):
+                    msgs.append(m)
+                else:
+                    raise ValueError("JSON line is not a string")
+            if msgs:
+                # Normalize each message (preserve \n for art)
+                out = []
+                for m in msgs:
+                    m = unicodedata.normalize("NFKC", m)
+                    m = re.sub(r'[\u200B-\u200F\uFEFF\u202A-\u202E\u2060-\u206F]', '', m)
+                    out.append(m)
+                return out
+        except Exception:
+            pass  # Fall through to block parsing on any error
 
-        # Fallback: read entire file as one block for separator-based splitting  
-        try:  
-            with open(names_arg, 'r', encoding='utf-8') as f:  
-                content = f.read()  
-        except Exception as e:  
-            raise ValueError(f"Failed to read file {names_arg}: {e}")  
-    else:  
-        # Direct string input  
-        content = str(names_arg)  
+        # Fallback: read entire file as one block for separator-based splitting
+        try:
+            with open(names_arg, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            raise ValueError(f"Failed to read file {names_arg}: {e}")
+    else:
+        # Direct string input
+        content = str(names_arg)
 
-    if content is None:  
-        raise ValueError("No valid content to parse")  
+    if content is None:
+        raise ValueError("No valid content to parse")
 
-    # Normalize content (preserve \n for ASCII art)  
-    #content = unicodedata.normalize("NFKC", content)  
-    #content = content.replace("\r\n", "\n").replace("\r", "\n")  
-    #content = re.sub(r'[\u200B-\u200F\uFEFF\u202A-\u202E\u2060-\u206F]', '', content)  
+    # Normalize content (preserve \n for ASCII art)
+    content = unicodedata.normalize("NFKC", content)
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    content = re.sub(r'[\u200B-\u200F\uFEFF\u202A-\u202E\u2060-\u206F]', '', content)
 
-    # Normalize ampersand-like characters to '&' for consistent splitting  
-    content = (  
-        content.replace('﹠', '&')  
-        .replace('＆', '&')  
-        .replace('⅋', '&')  
-        .replace('ꓸ', '&')  
-        .replace('︔', '&')  
-    )  
+    # Normalize ampersand-like characters to '&' for consistent splitting
+    content = (
+        content.replace('﹠', '&')
+        .replace('＆', '&')
+        .replace('⅋', '&')
+        .replace('ꓸ', '&')
+        .replace('︔', '&')
+    )
 
-    # Split only on explicit separators: '&' or the word 'and' (case-insensitive, with optional whitespace)  
-    # This preserves multi-line blocks like ASCII art unless explicitly separated  
-    pattern = r'\s*(?:&|\band\b)\s*'  
-    parts = [part.strip() for part in re.split(pattern, content, flags=re.IGNORECASE) if part.strip()]  
+    # Split only on explicit separators: '&' or the word 'and' (case-insensitive, with optional whitespace)
+    # This preserves multi-line blocks like ASCII art unless explicitly separated
+    pattern = r'\s*(?:&|and)\s*'
+    parts = [part.strip() for part in re.split(pattern, content, flags=re.IGNORECASE) if part.strip()]
     return parts
 
-async def login(args, storage_path, headless):
+async def sender(tab_id, page, args, messages, storage_path):
     """
-    Async login function to handle initial Instagram login and save storage state.
-    """
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=headless)
-            context = await browser.new_context()
-            page = await context.new_page()
-            try:
-                print("Logging in to Instagram...")
-                await page.goto("https://www.instagram.com/", timeout=60000)
-                await page.wait_for_selector('input[name="username"]', timeout=30000)
-                await page.fill('input[name="username"]', args.username)
-                await page.fill('input[name="password"]', args.password)
-                await page.click('button[type="submit"]')
-                # Wait for successful redirect (adjust if needed for 2FA or errors)
-                await page.wait_for_url("**/home**", timeout=60000)  # More specific to profile/home
-                print("Login successful, saving storage state.")
-                await context.storage_state(path=storage_path)
-                return True
-            except Exception as e:
-                print(f"Login error: {e}")
-                return False
-            finally:
-                await browser.close()
-    except Exception as e:
-        print(f"Unexpected login error: {e}")
-        return False
-
-async def sender(tab_id, args, messages, context, page):
-    """
-    Async sender coroutine: Cycles through messages in an infinite loop, preloading/reloading pages every 60s to avoid issues.
+    Sender task: Cycles through messages in an infinite loop, preloading/reloading pages every 60s to avoid issues.
     Preserves newlines in messages for multi-line content like ASCII art.
-    Uses shared context to create new pages for reloading.
     """
     dm_selector = 'div[role="textbox"][aria-label="Message"]'
     try:
+        await page.goto(args.thread_url, timeout=60000)
+        await page.wait_for_selector(dm_selector, timeout=30000)
         print(f"Tab {tab_id} ready, starting infinite message loop.")
         current_page = page
         cycle_start = time.time()
@@ -149,7 +120,7 @@ async def sender(tab_id, args, messages, context, page):
             if elapsed >= 50 and not preloaded_this_cycle:
                 preloaded_this_cycle = True
                 try:
-                    new_page = await context.new_page()
+                    new_page = await page.context.new_page()
                     await new_page.goto(args.thread_url, timeout=60000)
                     await new_page.wait_for_selector(dm_selector, timeout=30000)
                     print(f"Tab {tab_id} preloaded new page at {elapsed:.1f}s")
@@ -158,7 +129,7 @@ async def sender(tab_id, args, messages, context, page):
                     print(f"Tab {tab_id} failed to preload new page at {elapsed:.1f}s: {e}")
             msg = messages[msg_index]
             try:
-                if not current_page.locator(dm_selector).is_visible():
+                if not await current_page.locator(dm_selector).is_visible():
                     print(f"Tab {tab_id} selector not visible, skipping '{msg[:50]}...'")
                     await asyncio.sleep(0.3)
                     msg_index = (msg_index + 1) % len(messages)
@@ -176,6 +147,9 @@ async def sender(tab_id, args, messages, context, page):
             msg_index = (msg_index + 1) % len(messages)
     except Exception as e:
         print(f"Tab {tab_id} unexpected error: {e}")
+    finally:
+        if 'current_page' in locals() and not current_page.is_closed():
+            await current_page.close()
 
 async def main():
     parser = argparse.ArgumentParser(description="Instagram DM Auto Sender using Playwright")
@@ -189,57 +163,72 @@ async def main():
     args = parser.parse_args()
     args.names = sanitize_input(args.names)  # Handle bot/shell-truncated inputs
 
-    headless = args.headless == 'true'  
-    storage_path = args.storage_state  
-    do_login = not os.path.exists(storage_path)  
-
-    if do_login:  
-        if not args.username or not args.password:  
-            print("Error: Username and password required for initial login.")  
-            return  
-        success = await login(args, storage_path, headless)
-        if not success:
-            return
-    else:  
-        print("Using existing storage state, skipping login.")  
-
-    try:  
-        messages = parse_messages(args.names)  
-    except ValueError as e:  
-        print(f"Error parsing messages: {e}")  
-        return  
-
-    if not messages:  
-        print("Error: No valid messages provided.")  
-        return  
-
-    print(f"Parsed {len(messages)} messages.")  
-
-    tabs = min(max(args.tabs, 1), 5)  
+    headless = args.headless == 'true'
+    storage_path = args.storage_state
+    do_login = not os.path.exists(storage_path)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(storage_state=storage_path)
-        dm_selector = 'div[role="textbox"][aria-label="Message"]'
+        context = None
+        if do_login:
+            if not args.username or not args.password:
+                print("Error: Username and password required for initial login.")
+                await browser.close()
+                return
+            context = await browser.new_context()
+            page = await context.new_page()
+            try:
+                print("Logging in to Instagram...")
+                await page.goto("https://www.instagram.com/", timeout=60000)
+                await page.wait_for_selector('input[name="username"]', timeout=30000)
+                await page.fill('input[name="username"]', args.username)
+                await page.fill('input[name="password"]', args.password)
+                await page.click('button[type="submit"]')
+                # Wait for successful redirect (adjust if needed for 2FA or errors)
+                await page.wait_for_url("**/home**", timeout=60000)  # More specific to profile/home
+                print("Login successful, saving storage state.")
+                await context.storage_state(path=storage_path)
+            except Exception as e:
+                print(f"Login error: {e}")
+                await page.close()
+                await browser.close()
+                return
+            finally:
+                await page.close()
+        else:
+            print("Using existing storage state, skipping login.")
+            context = await browser.new_context(storage_state=storage_path)
+
+        try:
+            messages = parse_messages(args.names)
+        except ValueError as e:
+            print(f"Error parsing messages: {e}")
+            await browser.close()
+            return
+
+        if not messages:
+            print("Error: No valid messages provided.")
+            await browser.close()
+            return
+
+        print(f"Parsed {len(messages)} messages.")
+
+        tabs = min(max(args.tabs, 1), 5)
         pages = []
         for i in range(tabs):
             page = await context.new_page()
-            await page.goto(args.thread_url, timeout=60000)
-            await page.wait_for_selector(dm_selector, timeout=30000)
             pages.append(page)
-            print(f"Tab {i+1} ready.")
-        
-        tasks = []  
-        for i, page in enumerate(pages):  
-            task = asyncio.create_task(sender(i + 1, args, messages, context, page))  
-            tasks.append(task)  
 
-        print(f"Starting {tabs} tab(s) in infinite message loop. Press Ctrl+C to stop.")  
-        try:  
-            await asyncio.gather(*tasks)  
-        except KeyboardInterrupt:  
+        print(f"Starting {tabs} tab(s) in infinite message loop. Press Ctrl+C to stop.")
+        try:
+            tasks = [asyncio.create_task(sender(i + 1, pages[i], args, messages, storage_path)) for i in range(tabs)]
+            await asyncio.gather(*tasks)
+        except KeyboardInterrupt:
             print("\nStopping all tabs...")
         finally:
+            for page in pages:
+                if not page.is_closed():
+                    await page.close()
             await context.close()
             await browser.close()
 
