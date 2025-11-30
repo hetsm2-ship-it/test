@@ -16,6 +16,17 @@ def sanitize_input(raw):
         raw = " ".join(raw)
     return raw
 
+def clean_message(msg):
+    """
+    Clean message for ASCII art: rstrip each line to remove extra trailing spaces,
+    preserve multi-line structure and leading spaces as in original txt.
+    """
+    if not msg:
+        return ''
+    lines = msg.splitlines()
+    cleaned = [line.rstrip() for line in lines]
+    return '\n'.join(cleaned)
+
 def parse_messages(names_arg):
     """
     Robust parser for messages:
@@ -45,11 +56,7 @@ def parse_messages(names_arg):
                     raise ValueError("JSON line is not a string")  
             if msgs:  
                 # Normalize each message (preserve \n for art)  
-                out = []  
-                for m in msgs:  
-                    #m = unicodedata.normalize("NFKC", m)  
-                    #m = re.sub(r'[\u200B-\u200F\uFEFF\u202A-\u202E\u2060-\u206F]', '', m)  
-                    out.append(m)  
+                out = [clean_message(m) for m in msgs]  
                 return out  
         except Exception:  
             pass  # Fall through to block parsing on any error  
@@ -85,7 +92,7 @@ def parse_messages(names_arg):
     # This preserves multi-line blocks like ASCII art unless explicitly separated  
     pattern = r'\s*(?:&|\band\b)\s*'  
     parts = [part for part in re.split(pattern, content, flags=re.IGNORECASE) if part.strip()]  
-    return parts
+    return [clean_message(part) for part in parts]
 
 async def login(args, storage_path, headless):
     """
