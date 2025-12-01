@@ -122,89 +122,60 @@ async def sender(tab_id, args, messages, context, page):
     Async sender coroutine: Cycles through messages in an infinite loop, preloading/reloading pages every 60s to avoid issues.
     Preserves newlines in messages for multi-line content like ASCII art.
     Uses shared context to create new pages for reloading.
-    Enhanced with retry logic: If selector not visible or send fails, retry up to 3 times (press Enter to clear if stuck, then refill), skip if all retries fail, never crash.
+    Enhanced with retry logic: If selector not visible or send fails, retry up to 2 times (press Enter to clear if stuck, then refill), skip if all retries fail, never crash.
     """
     dm_selector = 'div[role="textbox"][aria-label="Message"]'
-    try:
-        print(f"Tab {tab_id} ready, starting infinite message loop.")
-        current_page = page
-        cycle_start = time.time()
-        msg_index = 0
-        while True:
-            elapsed = time.time() - cycle_start
-            if elapsed >= 60:
-                try:
-                    print(f"Tab {tab_id} reloading current page after {elapsed:.1f}s")
-                    await current_page.goto("https://www.instagram.com/", timeout=60000)
-                    await current_page.wait_for_url("**/home**", timeout=30000)
-                    await current_page.goto(args.thread_url, timeout=60000)
-                    await current_page.wait_for_selector(dm_selector, timeout=30000)
-                except Exception as reload_e:
-                    print(f"Tab {tab_id} reload failed after {elapsed:.1f}s: {reload_e}. Recreating page.")
+    print(f"Tab {tab_id} ready, starting infinite message loop.")
+    current_page = page
+    cycle_start = time.time()
+    msg_index = 0
+    while True:
+        elapsed = time.time() - cycle_start
+        if elapsed >= 60:
+            try:
+                print(f"Tab {tab_id} reloading current page after {elapsed:.1f}s")
+                await current_page.goto("https://www.instagram.com/", timeout=60000)
+                await current_page.goto(args.thread_url, timeout=60000)
+                await current_page.wait_for_selector(dm_selector, timeout=30000)
+            except Exception as reload_e:
+                print(f"Tab {tab_id} reload failed after {elapsed:.1f}s: {reload_e}")
+                raise Exception(f"Tab {tab_id} reload failed: {reload_e}")
+            cycle_start = time.time()
+            continue
+        msg = messages[msg_index]
+        send_success = False
+        max_retries = 2
+        for retry in range(max_retries):
+            try:
+                if not current_page.locator(dm_selector).is_visible():
+                    print(f"Tab {tab_id} selector not visible on retry {retry+1}/{max_retries} for '{msg[:50]}...', attempting Enter to clear.")
                     try:
-                        await current_page.close()
-                        current_page = await context.new_page()
-                        await current_page.goto("https://www.instagram.com/", timeout=60000)
-                        await current_page.wait_for_url("**/home**", timeout=30000)
-                        await current_page.goto(args.thread_url, timeout=60000)
-                        await current_page.wait_for_selector(dm_selector, timeout=30000)
-                    except Exception as recreate_e:
-                        print(f"Tab {tab_id} page recreation failed: {recreate_e}. Skipping cycle, continuing loop.")
-                        await asyncio.sleep(1)
-                cycle_start = time.time()
-                continue
-            msg = messages[msg_index]
-            send_success = False
-            max_retries = 1
-            for retry in range(max_retries):
-                try:
-                    if not current_page.locator(dm_selector).is_visible():
-                        print(f"Tab {tab_id} selector not visible on retry {retry+1}/{max_retries} for '{msg[:50]}...', attempting Enter to clear.")
-                        try:
-                            await current_page.press(dm_selector, 'Enter')
-                            await asyncio.sleep(0.2)
-                        except:
-                            pass  # Ignore clear failure
-                        await asyncio.sleep(0.5)  # Wait for potential update
-                        continue  # Retry visibility check
+                        await current_page.press(dm_selector, 'Enter')
+                        await asyncio.sleep(0.2)
+                    except:
+                        pass  # Ignore clear failure
+                    await asyncio.sleep(0.5)  # Wait for potential update
+                    continue  # Retry visibility check
 
-                    await current_page.click(dm_selector)
-                    # DO NOT replace \n with space: Preserve multi-line for ASCII art
-                    # Instagram DM supports multi-line messages via fill()
-                    await current_page.fill(dm_selector, msg)
-                    await current_page.press(dm_selector, 'Enter')
-                    print(f"Tab {tab_id} sent message {msg_index + 1}/{len(messages)} on retry {retry+1}")
-                    send_success = True
-                    break
-                except Exception as send_e:
-                    print(f"Tab {tab_id} send error on retry {retry+1}/{max_retries} for message {msg_index + 1}: {send_e}")
-                    if retry < max_retries - 1:
-                        print(f"Tab {tab_id} retrying after brief pause...")
-                        await asyncio.sleep(0.5)
-                    else:
-                        print(f"Tab {tab_id} all retries failed for message {msg_index + 1}, skipping to next.")
-            if not send_success:
-                print(f"Tab {tab_id} stuck after retries for message {msg_index + 1}, recreating via instagram.com")
-                try:
-                    await current_page.close()
-                    current_page = await context.new_page()
-                    await current_page.goto("https://www.instagram.com/", timeout=60000)
-                    await current_page.wait_for_url("**/home**", timeout=30000)
-                    await current_page.goto(args.thread_url, timeout=60000)
-                    await current_page.wait_for_selector(dm_selector, timeout=30000)
-                    print(f"Tab {tab_id} recreated successfully.")
-                except Exception as recreate_e:
-                    print(f"Tab {tab_id} recreation failed: {recreate_e}. Skipping cycle.")
-                    await asyncio.sleep(5)
-                    cycle_start = time.time()
-                    continue
-                await asyncio.sleep(0.3)
-            else:
-                await asyncio.sleep(0.3)  # Brief delay between successful sends
-            msg_index = (msg_index + 1) % len(messages)
-    except Exception as e:
-        print(f"Tab {tab_id} unexpected error: {e}. Continuing loop if possible.")
-        await asyncio.sleep(1)  # Brief pause before next iteration
+                await current_page.click(dm_selector)
+                # DO NOT replace \n with space: Preserve multi-line for ASCII art
+                # Instagram DM supports multi-line messages via fill()
+                await current_page.fill(dm_selector, msg)
+                await current_page.press(dm_selector, 'Enter')
+                print(f"Tab {tab_id} sent message {msg_index + 1}/{len(messages)} on retry {retry+1}")
+                send_success = True
+                break
+            except Exception as send_e:
+                print(f"Tab {tab_id} send error on retry {retry+1}/{max_retries} for message {msg_index + 1}: {send_e}")
+                if retry < max_retries - 1:
+                    print(f"Tab {tab_id} retrying after brief pause...")
+                    await asyncio.sleep(0.5)
+                else:
+                    print(f"Tab {tab_id} all retries failed for message {msg_index + 1}, triggering restart.")
+        if not send_success:
+            raise Exception(f"Tab {tab_id} failed to send after {max_retries} retries")
+        await asyncio.sleep(0.3)  # Brief delay between successful sends
+        msg_index = (msg_index + 1) % len(messages)
 
 async def main():
     parser = argparse.ArgumentParser(description="Instagram DM Auto Sender using Playwright")
@@ -251,26 +222,82 @@ async def main():
         context = await browser.new_context(storage_state=storage_path)
         dm_selector = 'div[role="textbox"][aria-label="Message"]'
         pages = []
-        for i in range(tabs):
-            page = await context.new_page()
-            await page.goto("https://www.instagram.com/", timeout=60000)
-            await page.wait_for_url("**/home**", timeout=30000)
-            await page.goto(args.thread_url, timeout=60000)
-            await page.wait_for_selector(dm_selector, timeout=30000)
-            pages.append(page)
-            print(f"Tab {i+1} ready.")
-        
-        tasks = []  
-        for i, page in enumerate(pages):  
-            task = asyncio.create_task(sender(i + 1, args, messages, context, page))  
-            tasks.append(task)  
+        tasks = []
+        try:
+            while True:
+                # Close previous pages and cancel tasks if any
+                for page in pages:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                pages = []
+                for task in tasks:
+                    try:
+                        task.cancel()
+                    except Exception:
+                        pass
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
 
-        print(f"Starting {tabs} tab(s) in infinite message loop. Press Ctrl+C to stop.")  
-        try:  
-            await asyncio.gather(*tasks)  
-        except KeyboardInterrupt:  
+                # Create new pages
+                for i in range(tabs):
+                    page = await context.new_page()
+                    init_success = False
+                    for init_try in range(3):
+                        try:
+                            await page.goto("https://www.instagram.com/", timeout=60000)
+                            await page.goto(args.thread_url, timeout=60000)
+                            await page.wait_for_selector(dm_selector, timeout=30000)
+                            init_success = True
+                            break
+                        except Exception as init_e:
+                            print(f"Tab {i+1} init try {init_try+1}/3 failed: {init_e}")
+                            if init_try < 2:
+                                await asyncio.sleep(2)
+                    if not init_success:
+                        print(f"Tab {i+1} failed to initialize after 3 tries, skipping.")
+                        try:
+                            await page.close()
+                        except:
+                            pass
+                        continue
+                    pages.append(page)
+                    print(f"Tab {len(pages)} ready.")
+
+                if not pages:
+                    print("No tabs could be initialized, exiting.")
+                    return
+
+                actual_tabs = len(pages)
+                tasks = [asyncio.create_task(sender(j + 1, args, messages, context, pages[j])) for j in range(actual_tabs)]
+                print(f"Starting {actual_tabs} tab(s) in infinite message loop. Press Ctrl+C to stop.")
+
+                pending = set(tasks)
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        if task.exception():
+                            exc = task.exception()
+                            print(f"Tab task raised exception: {exc}")
+                            # Cancel remaining tasks
+                            for t in list(pending):
+                                t.cancel()
+                            await asyncio.gather(*pending, return_exceptions=True)
+                            pending.clear()
+                            break
+                    else:
+                        continue
+                    break  # If we broke due to exception, exit inner while
+        except KeyboardInterrupt:
             print("\nStopping all tabs...")
         finally:
+            for page in pages:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
             await context.close()
             await browser.close()
 
