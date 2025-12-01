@@ -135,6 +135,8 @@ async def sender(tab_id, args, messages, context, page):
             if elapsed >= 60:
                 try:
                     print(f"Tab {tab_id} reloading current page after {elapsed:.1f}s")
+                    await current_page.goto("https://www.instagram.com/", timeout=60000)
+                    await current_page.wait_for_url("**/home**", timeout=30000)
                     await current_page.goto(args.thread_url, timeout=60000)
                     await current_page.wait_for_selector(dm_selector, timeout=30000)
                 except Exception as reload_e:
@@ -142,6 +144,8 @@ async def sender(tab_id, args, messages, context, page):
                     try:
                         await current_page.close()
                         current_page = await context.new_page()
+                        await current_page.goto("https://www.instagram.com/", timeout=60000)
+                        await current_page.wait_for_url("**/home**", timeout=30000)
                         await current_page.goto(args.thread_url, timeout=60000)
                         await current_page.wait_for_selector(dm_selector, timeout=30000)
                     except Exception as recreate_e:
@@ -180,6 +184,20 @@ async def sender(tab_id, args, messages, context, page):
                     else:
                         print(f"Tab {tab_id} all retries failed for message {msg_index + 1}, skipping to next.")
             if not send_success:
+                print(f"Tab {tab_id} stuck after retries for message {msg_index + 1}, recreating via instagram.com")
+                try:
+                    await current_page.close()
+                    current_page = await context.new_page()
+                    await current_page.goto("https://www.instagram.com/", timeout=60000)
+                    await current_page.wait_for_url("**/home**", timeout=30000)
+                    await current_page.goto(args.thread_url, timeout=60000)
+                    await current_page.wait_for_selector(dm_selector, timeout=30000)
+                    print(f"Tab {tab_id} recreated successfully.")
+                except Exception as recreate_e:
+                    print(f"Tab {tab_id} recreation failed: {recreate_e}. Skipping cycle.")
+                    await asyncio.sleep(5)
+                    cycle_start = time.time()
+                    continue
                 await asyncio.sleep(0.3)
             else:
                 await asyncio.sleep(0.3)  # Brief delay between successful sends
@@ -235,6 +253,8 @@ async def main():
         pages = []
         for i in range(tabs):
             page = await context.new_page()
+            await page.goto("https://www.instagram.com/", timeout=60000)
+            await page.wait_for_url("**/home**", timeout=30000)
             await page.goto(args.thread_url, timeout=60000)
             await page.wait_for_selector(dm_selector, timeout=30000)
             pages.append(page)
