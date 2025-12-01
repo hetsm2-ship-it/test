@@ -129,21 +129,14 @@ async def sender(tab_id, args, messages, context, page):
         print(f"Tab {tab_id} ready, starting infinite message loop.")
         current_page = page
         cycle_start = time.time()
-        new_page = None
-        preloaded_this_cycle = False
         msg_index = 0
         while True:
             elapsed = time.time() - cycle_start
             if elapsed >= 60:
                 try:
-                    if new_page is not None:
-                        await current_page.close()
-                        current_page = new_page
-                        print(f"Tab {tab_id} switched to new page after {elapsed:.1f}s")
-                    else:
-                        print(f"Tab {tab_id} no new page, reloading current after {elapsed:.1f}s")
-                        await current_page.goto(args.thread_url, timeout=60000)
-                        await current_page.wait_for_selector(dm_selector, timeout=30000)
+                    print(f"Tab {tab_id} reloading current page after {elapsed:.1f}s")
+                    await current_page.goto(args.thread_url, timeout=60000)
+                    await current_page.wait_for_selector(dm_selector, timeout=30000)
                 except Exception as reload_e:
                     print(f"Tab {tab_id} reload failed after {elapsed:.1f}s: {reload_e}. Recreating page.")
                     try:
@@ -155,19 +148,7 @@ async def sender(tab_id, args, messages, context, page):
                         print(f"Tab {tab_id} page recreation failed: {recreate_e}. Skipping cycle, continuing loop.")
                         await asyncio.sleep(1)
                 cycle_start = time.time()
-                new_page = None
-                preloaded_this_cycle = False
                 continue
-            if elapsed >= 50 and not preloaded_this_cycle:
-                preloaded_this_cycle = True
-                try:
-                    new_page = await context.new_page()
-                    await new_page.goto(args.thread_url, timeout=60000)
-                    await new_page.wait_for_selector(dm_selector, timeout=30000)
-                    print(f"Tab {tab_id} preloaded new page at {elapsed:.1f}s")
-                except Exception as preload_e:
-                    new_page = None
-                    print(f"Tab {tab_id} failed to preload new page at {elapsed:.1f}s: {preload_e}")
             msg = messages[msg_index]
             send_success = False
             max_retries = 1
