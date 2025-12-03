@@ -39,6 +39,8 @@ logging.basicConfig(
     ]
 )
 
+user_fetching = set()
+user_cancel_fetch = set()  # new set
 AUTHORIZED_FILE = 'authorized_users.json'
 TASKS_FILE = 'tasks.json'
 OWNER_TG_ID = int(os.environ.get('OWNER_TG_ID'))
@@ -808,7 +810,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
  /logout 🚪 <username> - Logout and remove account
  /kill 🛑 - Kill active login session
  /usg 📊 - System usage
- /cancel ❌ - Cancel fetching
     """
     if is_owner(user_id):
         help_text += """
@@ -1302,17 +1303,26 @@ async def get_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     text = update.message.text.lower().strip()
     data = users_data[user_id]
+
     if 'dm' in text:
         context.user_data['mode'] = 'dm'
         await update.message.reply_text("Enter target username (for DM):")
         return TARGET
+
     elif 'gc' in text:
         acc = data['accounts'][data['default']]
-        fetch_msg = await update.message.reply_text("🔍 Fetching last 10 GC threads... to cancel fetching type /cancel ❌")
+        fetch_msg = await update.message.reply_text("🔍 Fetching last 10 GC threads...")
+
         user_fetching.add(user_id)
         try:
             groups, new_state = await asyncio.to_thread(
-                list_group_chats, user_id, acc['storage_state'], acc['ig_username'], acc['password'], max_groups=10, amount=10
+                list_group_chats,
+                user_id,
+                acc['storage_state'],
+                acc['ig_username'],
+                acc['password'],
+                max_groups=10,
+                amount=10
             )
         finally:
             user_fetching.discard(user_id)
@@ -1320,19 +1330,31 @@ async def get_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 await fetch_msg.delete()
             except:
                 pass
+
+        # ✅ Agar beech me /cancel aaya tha to result ignore karo
+        if user_id in user_cancel_fetch:
+            user_cancel_fetch.discard(user_id)
+            await update.message.reply_text("❌ Fetching cancelled. Ignoring result. ❌")
+            return ConversationHandler.END
+
         if new_state != acc['storage_state']:
             acc['storage_state'] = new_state
             save_user_data(user_id, data)
+
         context.user_data['groups'] = groups
         context.user_data['mode'] = 'gc'
+
         if not groups:
             await update.message.reply_text("❌ No group chats found. ❌")
             return ConversationHandler.END
+
         msg = "🔢 Select a GC by number: 🔢\n"
         for i, g in enumerate(groups):
             msg += f"{i+1}. {g['display']}\n"
+
         await update.message.reply_text(msg)
         return SELECT_GC
+
     else:
         await update.message.reply_text("Please reply with 'dm' or 'gc'")
         return MODE
@@ -1347,7 +1369,7 @@ async def select_gc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             g = groups[num]
             context.user_data['thread_url'] = g['url']
             context.user_data['target_display'] = g['display']
-            await update.message.reply_text("Send messages like: msg1 & msg2 & msg3")
+            await update.message.reply_text("Send messages like: msg1 & msg2 & msg3 or upload .txt file")
             return MESSAGES
         else:
             await update.message.reply_text("⚠️ Invalid number. Please select 1-{}. ⚠️".format(len(groups)))
@@ -1372,29 +1394,66 @@ async def get_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Could not lock thread id with default account.")
         return ConversationHandler.END
     context.user_data['thread_url'] = thread_url
-    await update.message.reply_text("Send messages like: msg1 & msg2 & msg3")
+    await update.message.reply_text("Send messages like: msg1 & msg2 & msg3 or upload .txt file")
     return MESSAGES
-
-async def get_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    
+async def get_messages_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    raw_text = update.message.text.strip()
-    logging.debug("RAW MESSAGES INPUT: %r", raw_text)
+    document = update.message.document
 
-    # Normalize to handle fullwidth & etc.
-    text = unicodedata.normalize("NFKC", raw_text)
+    if not document:
+        await update.message.reply_text("❌ Please upload a .txt file.")
+        return ConversationHandler.END
 
-    # Always make a temp file
-    import uuid, os, json, time, random
+    file = await document.get_file()
+
+    import uuid, os
     randomid = str(uuid.uuid4())[:8]
     names_file = f"{user_id}_{randomid}.txt"
 
-    # ✅ Write raw text directly so msgb.py handles splitting correctly
-    try:
-        with open(names_file, 'w', encoding='utf-8') as f:
-            f.write(text)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error creating file: {e}")
-        return ConversationHandler.END
+    # Save uploaded .txt file
+    await file.download_to_drive(names_file)
+
+    # store file path in context so get_messages can use it
+    context.user_data['uploaded_names_file'] = names_file
+
+    # Reuse same logic as text handler
+    return await get_messages(update, context)
+
+async def get_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+
+    import uuid, os, json, time, random
+
+    # Check if we came from file upload handler
+    uploaded_file = context.user_data.pop('uploaded_names_file', None)
+
+    if uploaded_file and os.path.exists(uploaded_file):
+        # Use already saved .txt file from upload
+        names_file = uploaded_file
+        raw_text = f"[USING_UPLOADED_FILE:{os.path.basename(uploaded_file)}]"
+        logging.debug("USING UPLOADED FILE: %r", uploaded_file)
+    else:
+        # Normal text input flow
+        raw_text = (update.message.text or "").strip()
+        logging.debug("RAW MESSAGES INPUT: %r", raw_text)
+
+        # Normalize to handle fullwidth & etc.
+        text = unicodedata.normalize("NFKC", raw_text)
+
+        # Always make a temp file
+        randomid = str(uuid.uuid4())[:8]
+        names_file = f"{user_id}_{randomid}.txt"
+
+        # ✅ Write raw text directly so msgb.py handles splitting correctly
+        try:
+            with open(names_file, 'w', encoding='utf-8') as f:
+                f.write(text)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error creating file: {e}")
+            return ConversationHandler.END
+
+    # --- Below part unchanged (keeps rotation, task limits, etc.) ---
 
     # --- Below part unchanged (keeps rotation, task limits, etc.) ---
     data = users_data[user_id]
@@ -2034,7 +2093,10 @@ def main_bot():
             MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_mode)],
             SELECT_GC: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_gc_handler)],
             TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_target_handler)],
-            MESSAGES: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_messages)],
+            MESSAGES: [
+                MessageHandler(filters.Document.FileExtension("txt"), get_messages_file),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_messages),
+            ],
         },
         fallbacks=[],
     )
